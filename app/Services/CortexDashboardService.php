@@ -4,6 +4,8 @@ namespace App\Services;
 
 use Carbon\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Fetches and aggregates social monitoring data from the remote PostgreSQL
@@ -45,12 +47,12 @@ class CortexDashboardService
         foreach ($targets as $platform) {
             $query = $this->cortex->table($platform);
 
-            // Date range filter on created_at
+            // Date range filter on post_created_at (actual publish date)
             if (! empty($filters['start_date'])) {
-                $query->whereDate('created_at', '>=', $filters['start_date']);
+                $query->whereDate('post_created_at', '>=', $filters['start_date']);
             }
             if (! empty($filters['end_date'])) {
-                $query->whereDate('created_at', '<=', $filters['end_date']);
+                $query->whereDate('post_created_at', '<=', $filters['end_date']);
             }
 
             // Keyword filter: match against content column and metrics->>'caption'
@@ -150,6 +152,9 @@ class CortexDashboardService
      * a post (e.g. 'banjir', 'gempa', 'umkm'). It is the direct sentiment
      * source for platforms that have no objective signal (reactions).
      * For Facebook, reactions are used instead.
+     *
+     * Used only as an absolute last-resort fallback. Prefer the DB `sentiment`
+     * column (Priority 1) or the cached reference-schema map (Priority 2).
      */
     private const KEYWORD_SENTIMENTS = [
         // Negative — disaster / crisis topics
@@ -183,6 +188,12 @@ class CortexDashboardService
         'cuaca'        => 'neutral',
         'bmkg'         => 'neutral',
     ];
+
+    /**
+     * The client schema used as the reference source for keyword→sentiment
+     * mappings when the current client's schema has no sentiment column.
+     */
+    private const SENTIMENT_REFERENCE_SCHEMA = 'client_a';
 
     /**
      * @param  array<string, mixed>  $record  Raw DB row (metrics already decoded as array by PDO)
@@ -227,8 +238,8 @@ class CortexDashboardService
             'platform'  => 'facebook',
             'text'      => $text,
             'author'    => $author,
-            'date'      => $this->parseDate($record['created_at'] ?? null, $m['timestamp'] ?? null, 'unix'),
-            'sentiment' => $this->sentimentFromReactions($reactions),
+            'date'      => $this->parseDate($record['post_created_at'] ?? $record['created_at'] ?? null, $m['timestamp'] ?? null, 'unix'),
+            'sentiment' => $this->resolveSentiment($record, $reactions),
             'region'    => $this->extractRegion($text),
             'likes'     => (int) ($reactions['like'] ?? $m['reactions_count'] ?? 0),
             'comments'  => (int) ($m['comments_count'] ?? 0),
@@ -256,8 +267,8 @@ class CortexDashboardService
             'platform'  => 'instagram',
             'text'      => $text,
             'author'    => (string) ($m['ownerFullName'] ?? $m['ownerUsername'] ?? ''),
-            'date'      => $this->parseDate($record['created_at'] ?? null, $m['timestamp'] ?? null, 'iso'),
-            'sentiment' => $this->sentimentFromKeyword($record['keyword'] ?? ''),
+            'date'      => $this->parseDate($record['post_created_at'] ?? $record['created_at'] ?? null, $m['timestamp'] ?? null, 'iso'),
+            'sentiment' => $this->resolveSentiment($record),
             'region'    => $this->extractRegion($text),
             'likes'     => (int) ($m['likesCount'] ?? 0),
             'comments'  => (int) ($m['commentsCount'] ?? 0),
@@ -291,8 +302,8 @@ class CortexDashboardService
             'platform'  => 'tiktok',
             'text'      => $text,
             'author'    => $author,
-            'date'      => $this->parseDate($record['created_at'] ?? null, $m['createTimeISO'] ?? null, 'iso'),
-            'sentiment' => $this->sentimentFromKeyword($record['keyword'] ?? ''),
+            'date'      => $this->parseDate($record['post_created_at'] ?? $record['created_at'] ?? null, $m['createTimeISO'] ?? null, 'iso'),
+            'sentiment' => $this->resolveSentiment($record),
             'region'    => $this->extractRegion($text),
             'likes'     => (int) ($m['diggCount'] ?? 0),
             'comments'  => (int) ($m['commentCount'] ?? 0),
@@ -336,8 +347,8 @@ class CortexDashboardService
             'platform'  => 'twitter',
             'text'      => $text,
             'author'    => $author,
-            'date'      => $this->parseDate($record['created_at'] ?? null, $m['createdAt'] ?? null, 'rfc'),
-            'sentiment' => $this->sentimentFromKeyword($record['keyword'] ?? ''),
+            'date'      => $this->parseDate($record['post_created_at'] ?? $record['created_at'] ?? null, $m['createdAt'] ?? null, 'rfc'),
+            'sentiment' => $this->resolveSentiment($record),
             'region'    => $region,
             'likes'     => (int) ($m['likeCount'] ?? 0),
             'comments'  => (int) ($m['replyCount'] ?? 0),
@@ -361,8 +372,8 @@ class CortexDashboardService
             'platform'  => $platform,
             'text'      => $text,
             'author'    => '',
-            'date'      => $this->parseDate($record['created_at'] ?? null, null, 'iso'),
-            'sentiment' => $this->sentimentFromKeyword($record['keyword'] ?? ''),
+            'date'      => $this->parseDate($record['post_created_at'] ?? $record['created_at'] ?? null, null, 'iso'),
+            'sentiment' => $this->resolveSentiment($record),
             'region'    => $this->extractRegion($text),
             'likes'     => 0,
             'comments'  => 0,
@@ -409,6 +420,91 @@ class CortexDashboardService
             return 'positive';
         }
         return 'neutral';
+    }
+
+    /**
+     * Unified sentiment resolver — three-tier priority:
+     *
+     *  1. DB column  : `$record['sentiment']` when the client schema has the column.
+     *  2. Cached map : keyword→sentiment loaded once from the reference schema (client_a)
+     *                  and stored in the Laravel cache for 1 hour.
+     *  3. Reactions  : Facebook-specific objective signal (passed via `$reactions`).
+     *  4. Hardcoded  : KEYWORD_SENTIMENTS — absolute last resort.
+     *
+     * @param  array<string, mixed>  $record     Normalised DB row.
+     * @param  array<string, int>|null  $reactions  Facebook reactions map, or null.
+     */
+    private function resolveSentiment(array $record, ?array $reactions = null): string
+    {
+        // Priority 1: DB column value (present when schema has the sentiment column)
+        $dbSentiment = $record['sentiment'] ?? null;
+        if (in_array($dbSentiment, ['positive', 'negative', 'neutral'], true)) {
+            return $dbSentiment;
+        }
+
+        // Priority 2: Keyword map cached from the reference schema
+        $keyword = strtolower(trim((string) ($record['keyword'] ?? '')));
+        if ($keyword !== '') {
+            $map = $this->getKeywordSentimentMap();
+            if (isset($map[$keyword])) {
+                return $map[$keyword];
+            }
+        }
+
+        // Priority 3: Reactions signal (Facebook)
+        if ($reactions !== null) {
+            return $this->sentimentFromReactions($reactions);
+        }
+
+        // Priority 4: Hardcoded fallback
+        return self::KEYWORD_SENTIMENTS[$keyword] ?? 'neutral';
+    }
+
+    /**
+     * Build (and cache for 1 hour) a keyword→sentiment map loaded from all
+     * platform tables in SENTIMENT_REFERENCE_SCHEMA that have a `sentiment`
+     * column.  Used as fallback when the current client's schema has no
+     * sentiment column yet.
+     *
+     * @return array<string, string>  e.g. ['banjir' => 'negative', ...]
+     */
+    private function getKeywordSentimentMap(): array
+    {
+        return Cache::store('file')->remember('cortex_keyword_sentiment_map', now()->addHour(), function () {
+            $refSchema = self::SENTIMENT_REFERENCE_SCHEMA;
+            $platforms = ['facebook', 'instagram', 'tiktok', 'twitter'];
+            $map       = [];
+            $conn      = $this->cortex->connection();
+
+            foreach ($platforms as $platform) {
+                $hasColumn = $conn->table('information_schema.columns')
+                    ->where('table_schema', $refSchema)
+                    ->where('table_name', $platform)
+                    ->where('column_name', 'sentiment')
+                    ->exists();
+
+                if (! $hasColumn) {
+                    continue;
+                }
+
+                $rows = $conn->table(DB::raw("\"{$refSchema}\".\"{$platform}\""))
+                    ->select('keyword', 'sentiment')
+                    ->whereNotNull('sentiment')
+                    ->whereNotNull('keyword')
+                    ->where('keyword', '!=', '')
+                    ->distinct()
+                    ->get();
+
+                foreach ($rows as $row) {
+                    $kw = strtolower(trim((string) $row->keyword));
+                    if ($kw !== '' && ! isset($map[$kw])) {
+                        $map[$kw] = $row->sentiment;
+                    }
+                }
+            }
+
+            return $map;
+        });
     }
 
     // ──────────────────────────────────────────────────────────────────────
