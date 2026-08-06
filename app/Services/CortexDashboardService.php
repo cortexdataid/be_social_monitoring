@@ -55,14 +55,20 @@ class CortexDashboardService
                 $query->whereDate('post_created_at', '<=', $filters['end_date']);
             }
 
-            // Keyword filter: match against content column and metrics->>'caption'
+            // Keyword filter: support both text search and array of keywords
             if (! empty($filters['keyword'])) {
-                $kw = '%' . $filters['keyword'] . '%';
-                $query->where(function ($q) use ($kw) {
-                    $q->where('content', 'ilike', $kw)
-                      ->orWhere('keyword', 'ilike', $kw)
-                      ->orWhereRaw("metrics->>'caption' ilike ?", [$kw]);
-                });
+                if (is_array($filters['keyword'])) {
+                    // Multi-select: filter by exact keyword match using IN clause
+                    $query->whereIn('keyword', $filters['keyword']);
+                } else {
+                    // Text search: match against content column and metrics->>'caption'
+                    $kw = '%' . $filters['keyword'] . '%';
+                    $query->where(function ($q) use ($kw) {
+                        $q->where('content', 'ilike', $kw)
+                          ->orWhere('keyword', 'ilike', $kw)
+                          ->orWhereRaw("metrics->>'caption' ilike ?", [$kw]);
+                    });
+                }
             }
 
             $rawRows = $query->get();
@@ -127,7 +133,7 @@ class CortexDashboardService
      * Return the union of all distinct filter option values across all rows.
      *
      * @param  array<int, array<string, mixed>>  $items
-     * @return array{platforms: array<string>, regions: array<string>}
+     * @return array{platforms: array<string>, regions: array<string>, keywords: array<string>}
      */
     public function getAvailableFilters(array $items): array
     {
@@ -136,7 +142,38 @@ class CortexDashboardService
         return [
             'platforms' => $collection->pluck('platform')->unique()->values()->all(),
             'regions'   => $collection->pluck('region')->filter()->unique()->values()->all(),
+            'keywords'   => $this->getDistinctKeywords(),
         ];
+    }
+
+    /**
+     * Fetch distinct keywords from all platform tables.
+     *
+     * @return array<string>
+     */
+    public function getDistinctKeywords(): array
+    {
+        $platforms = $this->cortex->availablePlatforms();
+        $keywords = [];
+
+        foreach ($platforms as $platform) {
+            $rows = $this->cortex->table($platform)
+                ->select('keyword')
+                ->whereNotNull('keyword')
+                ->where('keyword', '!=', '')
+                ->distinct()
+                ->orderBy('keyword', 'asc')
+                ->get();
+
+            foreach ($rows as $row) {
+                $kw = trim((string) $row->keyword);
+                if ($kw !== '' && ! in_array($kw, $keywords, true)) {
+                    $keywords[] = $kw;
+                }
+            }
+        }
+
+        return $keywords;
     }
 
     // ──────────────────────────────────────────────────────────────────────
