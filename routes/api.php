@@ -13,7 +13,8 @@ Route::post('/login',    [AuthController::class, 'login']);
 Route::middleware('auth:sanctum')->group(function () {
     Route::post('/logout',      [AuthController::class, 'logout']);
     Route::get('/me',           [AuthController::class, 'me']);
-    Route::get('/dashboard',    [DashboardController::class, 'index']);
+    Route::get('/dashboard',        [DashboardController::class, 'index']);
+    Route::get('/dashboard/export', [DashboardController::class, 'export']);
     Route::get('/preferences',  [UserPreferenceController::class, 'show']);
     Route::put('/preferences',  [UserPreferenceController::class, 'update']);
 });
