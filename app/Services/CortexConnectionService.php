@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Database\Connection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
@@ -66,9 +67,26 @@ class CortexConnectionService
      */
     public function availablePlatforms(array $candidates = ['facebook', 'instagram', 'tiktok', 'twitter']): array
     {
-        return array_values(
+        $ttl = (int) config('cortex.schema_cache_ttl');
+
+        $discover = fn () => array_values(
             array_filter($candidates, fn (string $platform) => $this->tableExists($platform))
         );
+
+        if ($ttl <= 0) {
+            return $discover();
+        }
+
+        // Keyed on the schema, not just the instance: this service is a
+        // singleton whose schema changes with setSchema(), so an instance-scoped
+        // memo would hand one client another client's platform list.
+        $key = sprintf(
+            'cortex_platforms_%s_%s',
+            $this->schema,
+            md5(json_encode($candidates)),
+        );
+
+        return Cache::store('file')->remember($key, now()->addSeconds($ttl), $discover);
     }
 
     /**

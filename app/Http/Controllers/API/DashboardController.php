@@ -27,6 +27,10 @@ class DashboardController extends Controller
      *     @OA\Parameter(name="keyword", in="query", required=false, @OA\Schema(type="string"), description="Search keyword in content"),
      *     @OA\Parameter(name="platform", in="query", required=false, @OA\Schema(type="string", enum={"facebook","instagram","tiktok","twitter"}), description="Filter by platform"),
      *     @OA\Parameter(name="region", in="query", required=false, @OA\Schema(type="string"), description="Filter by region"),
+     *     @OA\Parameter(name="page", in="query", required=false, @OA\Schema(type="integer", default=1), description="Page of the `table` result set"),
+     *     @OA\Parameter(name="per_page", in="query", required=false, @OA\Schema(type="integer", default=50, maximum=200), description="Rows per page, capped at 200"),
+     *     @OA\Parameter(name="sort_by", in="query", required=false, @OA\Schema(type="string", enum={"date","platform","region","sentiment","author","likes","comments","shares","views"}), description="Sort column for `table` (default: date)"),
+     *     @OA\Parameter(name="sort_dir", in="query", required=false, @OA\Schema(type="string", enum={"asc","desc"}, default="desc"), description="Sort direction for `table`"),
      *     @OA\Response(
      *         response=200,
      *         description="Dashboard data",
@@ -54,6 +58,11 @@ class DashboardController extends Controller
      *                 @OA\Property(property="positive", type="integer"),
      *                 @OA\Property(property="neutral", type="integer"),
      *                 @OA\Property(property="negative", type="integer"),
+     *                 @OA\Property(property="total", type="integer")
+     *             )),
+     *             @OA\Property(property="trend_by_platform", type="array", description="Mentions per date and platform, for the multi-line trend chart", @OA\Items(type="object",
+     *                 @OA\Property(property="date", type="string", format="date"),
+     *                 @OA\Property(property="platform", type="string"),
      *                 @OA\Property(property="total", type="integer")
      *             )),
      *             @OA\Property(property="platform_sentiment", type="array", @OA\Items(type="object",
@@ -101,7 +110,13 @@ class DashboardController extends Controller
      *                 @OA\Property(property="views", type="integer"),
      *                 @OA\Property(property="hashtags", type="array", @OA\Items(type="string")),
      *                 @OA\Property(property="url", type="string")
-     *             ))
+     *             )),
+     *             @OA\Property(property="meta", type="object", description="Pagination state for `table`",
+     *                 @OA\Property(property="total", type="integer"),
+     *                 @OA\Property(property="page", type="integer"),
+     *                 @OA\Property(property="per_page", type="integer"),
+     *                 @OA\Property(property="pages", type="integer")
+     *             )
      *         )
      *     ),
      *     @OA\Response(response=401, description="Unauthenticated")
@@ -125,18 +140,19 @@ class DashboardController extends Controller
             ]);
         }
 
-        $filters = [
-            'start_date' => $request->query('start_date'),
-            'end_date'   => $request->query('end_date'),
-            'keyword'    => $request->query('keyword') ? explode(',', $request->query('keyword')) : null,
-            'platform'   => $request->query('platform'),
-            'region'     => $request->query('region'),
-        ];
+        $filters       = $this->filtersFrom($request);
+        $stats         = $this->service->getAggregates($platforms, $filters);
+        $filterOptions = $this->service->getFilterOptions($platforms);
 
-        $allItems      = $this->service->getFilteredData($platforms, []);
-        $filtered      = $this->service->getFilteredData($platforms, $filters);
-        $stats         = $this->service->getStatistics($filtered);
-        $filterOptions = $this->service->getAvailableFilters($allItems);
+        $page = $this->service->getTablePage(
+            $platforms,
+            $filters,
+            (int) $request->query('page', 1),
+            (int) $request->query('per_page', 50),
+            $request->query('sort_by'),
+            (string) $request->query('sort_dir', 'desc'),
+            $stats['total'],
+        );
 
         return response()->json([
             'filters'              => $filterOptions,
@@ -145,14 +161,73 @@ class DashboardController extends Controller
             'negative_words'       => $stats['negative_words'],
             'positive_words'       => $stats['positive_words'],
             'trend'                => $stats['trend'],
+            'trend_by_platform'    => $stats['trend_by_platform'],
             'platform_sentiment'   => $stats['platform_sentiment'],
             'mention_by_platform'  => $stats['mention_by_platform'],
             'mention_by_media'     => $stats['mention_by_media'],
             'mention_by_province'  => $stats['mention_by_province'],
             'top_topics'           => $stats['top_topics'],
             'engagement'           => $stats['engagement'],
-            'table'                => $filtered,
+            'table'                => $page['data'],
+            'meta'                 => $page['meta'],
         ]);
     }
-}
 
+    /**
+     * @OA\Get(
+     *     path="/api/dashboard/export",
+     *     summary="Every row matching the current filters, for report download",
+     *     description="Same filters as /api/dashboard but without pagination. Kept as its own endpoint so the dashboard itself can stay paginated — do not call it to render the table.",
+     *     tags={"Dashboard"},
+     *     security={{"sanctum":{}}},
+     *     @OA\Parameter(name="start_date", in="query", required=false, @OA\Schema(type="string", format="date")),
+     *     @OA\Parameter(name="end_date", in="query", required=false, @OA\Schema(type="string", format="date")),
+     *     @OA\Parameter(name="keyword", in="query", required=false, @OA\Schema(type="string"), description="Comma-separated keywords"),
+     *     @OA\Parameter(name="platform", in="query", required=false, @OA\Schema(type="string", enum={"facebook","instagram","tiktok","twitter"})),
+     *     @OA\Parameter(name="region", in="query", required=false, @OA\Schema(type="string")),
+     *     @OA\Response(
+     *         response=200,
+     *         description="All matching rows",
+     *         @OA\JsonContent(
+     *             @OA\Property(property="table", type="array", @OA\Items(type="object")),
+     *             @OA\Property(property="total", type="integer")
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthenticated")
+     * )
+     */
+    public function export(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $this->cortex->setSchema($user->name);
+
+        $platforms = $this->cortex->availablePlatforms();
+
+        if (empty($platforms)) {
+            return response()->json(['table' => [], 'total' => 0]);
+        }
+
+        $rows = $this->service->getFilteredData($platforms, $this->filtersFrom($request));
+
+        return response()->json([
+            'table' => $rows,
+            'total' => count($rows),
+        ]);
+    }
+
+    /**
+     * Read the shared filter set off the query string.
+     *
+     * @return array{start_date:string|null, end_date:string|null, keyword:array<string>|null, platform:string|null, region:string|null}
+     */
+    private function filtersFrom(Request $request): array
+    {
+        return [
+            'start_date' => $request->query('start_date'),
+            'end_date'   => $request->query('end_date'),
+            'keyword'    => $request->query('keyword') ? explode(',', $request->query('keyword')) : null,
+            'platform'   => $request->query('platform'),
+            'region'     => $request->query('region'),
+        ];
+    }
+}

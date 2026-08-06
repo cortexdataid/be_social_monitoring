@@ -3,7 +3,6 @@
 namespace App\Services;
 
 use Carbon\Carbon;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
@@ -18,7 +17,88 @@ use Illuminate\Support\Facades\DB;
  */
 class CortexDashboardService
 {
+    /** Upper bound on `per_page`, so a crafted request cannot ask for the whole table back. */
+    public const MAX_PER_PAGE = 200;
+
+    /**
+     * Province list used both by extractRegion() in PHP and by regionSql()
+     * in Postgres. Order is significant — the first match wins — so the two
+     * must stay in sync.
+     */
+    private const PROVINCES = [
+        'Aceh', 'Sumatera Utara', 'Sumatera Barat', 'Riau', 'Jambi',
+        'Sumatera Selatan', 'Bengkulu', 'Lampung', 'Bangka Belitung',
+        'Kepulauan Riau', 'DKI Jakarta', 'Jakarta', 'Jawa Barat',
+        'Jawa Tengah', 'DI Yogyakarta', 'Yogyakarta', 'Jawa Timur',
+        'Banten', 'Bali', 'Nusa Tenggara Barat', 'Nusa Tenggara Timur',
+        'Kalimantan Barat', 'Kalimantan Tengah', 'Kalimantan Selatan',
+        'Kalimantan Timur', 'Kalimantan Utara', 'Sulawesi Utara',
+        'Sulawesi Tengah', 'Sulawesi Selatan', 'Sulawesi Tenggara',
+        'Gorontalo', 'Sulawesi Barat', 'Maluku', 'Maluku Utara',
+        'Papua Barat', 'Papua',
+    ];
+
+    /**
+     * Bumped whenever the shape of anything cached here changes, so a deploy
+     * can never serve an entry written by the previous version.
+     */
+    private const CACHE_VERSION = 'v2';
+
     public function __construct(private readonly CortexConnectionService $cortex) {}
+
+    /**
+     * Memoise a derived result on the file store, scoped to the active schema.
+     *
+     * Always the file store: CACHE_STORE points at the same remote Postgres
+     * these caches exist to avoid, so the default store would add a round trip
+     * instead of removing one. A ttl of 0 or less bypasses the cache.
+     *
+     * @param  string  $kind       Namespace for the key, e.g. 'aggregates'.
+     * @param  array<mixed>  $keyParts  Everything the result depends on.
+     */
+    private function remember(string $kind, int $ttl, array $keyParts, \Closure $compute): mixed
+    {
+        if ($ttl <= 0) {
+            return $compute();
+        }
+
+        $key = sprintf(
+            'cortex_%s_%s_%s_%s',
+            $kind,
+            self::CACHE_VERSION,
+            $this->cortex->currentSchema(),
+            md5(json_encode($keyParts)),
+        );
+
+        return Cache::store('file')->remember($key, now()->addSeconds($ttl), $compute);
+    }
+
+    /**
+     * Reduce a filter set to a stable cache key component: drop empties, fix
+     * the ordering, so ['b','a'] and ['a','b'] land on the same entry.
+     *
+     * @param  array<string, mixed>  $filters
+     * @return array<string, mixed>
+     */
+    private function canonicalFilters(array $filters): array
+    {
+        $keyword = $filters['keyword'] ?? null;
+        if (is_array($keyword)) {
+            sort($keyword);
+        }
+
+        $canonical = array_filter([
+            'start_date' => $filters['start_date'] ?? null,
+            'end_date'   => $filters['end_date'] ?? null,
+            'platform'   => $filters['platform'] ?? null,
+            'region'     => $filters['region'] ?? null,
+            'keyword'    => $keyword,
+        ], fn ($value) => $value !== null && $value !== '' && $value !== []);
+
+        ksort($canonical);
+
+        return $canonical;
+    }
 
     // ──────────────────────────────────────────────────────────────────────
     // Public API
@@ -47,12 +127,14 @@ class CortexDashboardService
         foreach ($targets as $platform) {
             $query = $this->cortex->table($platform);
 
-            // Date range filter on post_created_at (actual publish date)
+            // Date range filter on post_created_at (actual publish date).
+            // Plain comparisons rather than whereDate(), which wraps the column
+            // in `::date` and makes a btree index on it unusable.
             if (! empty($filters['start_date'])) {
-                $query->whereDate('post_created_at', '>=', $filters['start_date']);
+                $query->where('post_created_at', '>=', $filters['start_date']);
             }
             if (! empty($filters['end_date'])) {
-                $query->whereDate('post_created_at', '<=', $filters['end_date']);
+                $query->where('post_created_at', '<', Carbon::parse($filters['end_date'])->addDay()->toDateString());
             }
 
             // Keyword filter: support both text search and array of keywords
@@ -71,7 +153,7 @@ class CortexDashboardService
                 }
             }
 
-            $rawRows = $query->get();
+            $rawRows = $query->selectRaw($this->selectSql($platform))->get();
 
             foreach ($rawRows as $record) {
                 $normalised = $this->normalise($platform, (array) $record);
@@ -93,87 +175,814 @@ class CortexDashboardService
     }
 
     /**
-     * Compute aggregated statistics from a collection of normalised rows.
-     * The shape mirrors what DashboardDataService::getStatistics() returns.
+     * Metrics JSONB keys each platform normalizer actually reads.
      *
-     * @param  array<int, array<string, mixed>>  $items
-     * @return array<string, mixed>
+     * The raw `metrics` column averages 2.3-4 KB per row (25 MB for instagram
+     * alone), but the normalizers only ever touch these keys. Projecting them
+     * with jsonb_build_object keeps the wire format identical — normalise()
+     * still receives a `metrics` object — while leaving the rest in Postgres.
      */
-    public function getStatistics(array $items): array
+    private const METRIC_KEYS = [
+        'facebook'  => ['post_id', 'author', 'reactions', 'message', 'timestamp',
+                        'reactions_count', 'comments_count', 'reshare_count', 'url', 'type', 'image'],
+        'instagram' => ['id', 'hashtags', 'caption', 'ownerFullName', 'ownerUsername', 'timestamp',
+                        'likesCount', 'commentsCount', 'url', 'type', 'displayUrl'],
+        'tiktok'    => ['id', 'hashtags', 'authorMeta', 'text', 'createTimeISO',
+                        'diggCount', 'commentCount', 'shareCount', 'playCount', 'webVideoUrl'],
+        'twitter'   => ['id', 'author', 'entities', 'fullText', 'text', 'place', 'createdAt',
+                        'likeCount', 'replyCount', 'retweetCount', 'viewCount', 'url', 'twitterUrl',
+                        'type', 'media'],
+    ];
+
+    /** Columns every normalizer reads straight off the row. */
+    private const BASE_COLUMNS = 'id, post_id, keyword, content, sentiment, post_created_at, created_at';
+
+    /**
+     * Build the SELECT list for a platform table: the base columns plus a
+     * trimmed-down `metrics` object. Unknown platforms fall back to the whole
+     * blob, since normaliseGeneric() cannot know which keys matter.
+     */
+    private function selectSql(string $platform): string
     {
-        $collection = collect($items);
+        $keys = self::METRIC_KEYS[$platform] ?? null;
 
-        $total    = $collection->count();
-        $positive = $collection->where('sentiment', 'positive')->count();
-        $negative = $collection->where('sentiment', 'negative')->count();
-        $neutral  = $total - $positive - $negative;
+        if ($keys === null) {
+            return self::BASE_COLUMNS . ', metrics';
+        }
 
-        $netSentiment = $total > 0 ? round((($positive - $negative) / $total) * 100, 2) : 0;
+        // Keys come from the constant above, never from user input.
+        $pairs = array_map(fn (string $key) => "'{$key}', metrics->'{$key}'", $keys);
 
-        return [
-            'net_sentiment'        => $netSentiment,
-            'sentiment_percentage' => [
-                'positive' => $total > 0 ? round($positive / $total * 100, 2) : 0,
-                'neutral'  => $total > 0 ? round($neutral  / $total * 100, 2) : 0,
-                'negative' => $total > 0 ? round($negative / $total * 100, 2) : 0,
-            ],
-            'negative_words'       => $this->topWords($collection->where('sentiment', 'negative')),
-            'positive_words'       => $this->topWords($collection->where('sentiment', 'positive')),
-            'trend'                => $this->buildTrend($collection),
-            'platform_sentiment'   => $this->buildPlatformSentiment($collection),
-            'mention_by_platform'  => $this->buildMentionByPlatform($collection),
-            'mention_by_media'     => $this->buildMentionByMedia($collection),
-            'mention_by_province'  => $this->buildMentionByProvince($collection),
-            'top_topics'           => $this->buildTopTopics($collection),
-            'engagement'           => $this->buildEngagement($collection),
-        ];
+        return self::BASE_COLUMNS . ', jsonb_build_object(' . implode(', ', $pairs) . ') AS metrics';
     }
 
     /**
-     * Return the union of all distinct filter option values across all rows.
+     * Return the filter dropdown options.
      *
-     * @param  array<int, array<string, mixed>>  $items
+     * This used to take the full unfiltered dataset and pluck the distinct
+     * values out of it in PHP, which meant every dashboard request pulled all
+     * ~9.5k rows a second time (65s, 102 MB) purely to build a handful of
+     * short lists. Everything here is derived from the platform list the
+     * caller already has, or from DISTINCT queries that return at most a few
+     * dozen rows.
+     *
+     * @param  array<string>  $platforms  Platforms already discovered by the caller.
      * @return array{platforms: array<string>, regions: array<string>, keywords: array<string>}
      */
-    public function getAvailableFilters(array $items): array
+    public function getFilterOptions(array $platforms): array
     {
-        $collection = collect($items);
-
         return [
-            'platforms' => $collection->pluck('platform')->unique()->values()->all(),
-            'regions'   => $collection->pluck('region')->filter()->unique()->values()->all(),
-            'keywords'   => $this->getDistinctKeywords(),
+            'platforms' => array_values($platforms),
+            'regions'   => $this->getDistinctRegions($platforms),
+            'keywords'  => $this->getDistinctKeywords($platforms),
         ];
     }
 
     /**
-     * Fetch distinct keywords from all platform tables.
+     * Fetch distinct keywords across the given platform tables.
      *
+     * @param  array<string>  $platforms
      * @return array<string>
      */
-    public function getDistinctKeywords(): array
+    public function getDistinctKeywords(array $platforms): array
     {
-        $platforms = $this->cortex->availablePlatforms();
-        $keywords = [];
+        return $this->remember('keywords', (int) config('cortex.filter_cache_ttl'), [$platforms], function () use ($platforms) {
+            $keywords = [];
 
+            foreach ($platforms as $platform) {
+                $rows = $this->cortex->table($platform)
+                    ->select('keyword')
+                    ->whereNotNull('keyword')
+                    ->where('keyword', '!=', '')
+                    ->distinct()
+                    ->get();
+
+                foreach ($rows as $row) {
+                    $kw = trim((string) $row->keyword);
+                    if ($kw !== '') {
+                        // Array keys dedup in O(1); in_array() made this O(n²).
+                        $keywords[$kw] = true;
+                    }
+                }
+            }
+
+            $keywords = array_keys($keywords);
+            sort($keywords);
+
+            return $keywords;
+        });
+    }
+
+    /**
+     * Fetch the distinct regions present in the data.
+     *
+     * Region is derived from the post text rather than stored as a column, so
+     * the match runs as a CASE expression inside Postgres and only the ≤36
+     * distinct results cross the wire — instead of every row's content.
+     *
+     * @param  array<string>  $platforms
+     * @return array<string>
+     */
+    public function getDistinctRegions(array $platforms): array
+    {
+        return $this->remember('regions', (int) config('cortex.filter_cache_ttl'), [$platforms], function () use ($platforms) {
+            $regions = [];
+
+            foreach ($platforms as $platform) {
+                $rows = $this->cortex->table($platform)
+                    ->selectRaw('DISTINCT ' . $this->regionSql($platform) . ' AS region')
+                    ->get();
+
+                foreach ($rows as $row) {
+                    $region = trim((string) ($row->region ?? ''));
+                    if ($region !== '') {
+                        $regions[$region] = true;
+                    }
+                }
+            }
+
+            $regions = array_keys($regions);
+            sort($regions);
+
+            return $regions;
+        });
+    }
+
+    /**
+     * SQL mirror of extractRegion(): first province name found in the text
+     * wins, in the same order as the PHP list. Twitter additionally prefers
+     * the `place` object, exactly like normaliseTwitter() does.
+     */
+    private function regionSql(string $platform): string
+    {
+        $cases = '';
+        foreach (self::PROVINCES as $province) {
+            $escaped = str_replace("'", "''", $province);
+            $cases .= " WHEN content ILIKE '%{$escaped}%' THEN '{$escaped}'";
+        }
+        $case = "CASE{$cases} ELSE '' END";
+
+        if ($platform === 'twitter') {
+            return "COALESCE("
+                 . "NULLIF(metrics->'place'->>'full_name', ''), "
+                 . "NULLIF(metrics->'place'->>'name', ''), "
+                 . $case
+                 . ")";
+        }
+
+        return $case;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // SQL-side aggregation
+    //
+    // Every figure on the dashboard is a count, a sum, or a top-N. Computing
+    // them in PHP meant shipping all ~9.5k rows (content text included) across
+    // a link where a full instagram fetch alone costs 46s. These queries do
+    // the same arithmetic in Postgres and return tens of rows instead.
+    //
+    // The projections below must stay behaviourally identical to the PHP
+    // normalizers — resolveSentiment(), parseDate(), extractRegion() and the
+    // per-platform hashtag/engagement mapping all have a mirror here.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * Aggregate statistics without materialising the rows in PHP.
+     *
+     * @param  array<string>  $platforms
+     * @param  array<string, mixed>  $filters
+     * @return array<string, mixed>
+     */
+    public function getAggregates(array $platforms, array $filters): array
+    {
+        return $this->remember(
+            'aggregates',
+            (int) config('cortex.aggregate_cache_ttl'),
+            [$platforms, $this->canonicalFilters($filters)],
+            fn () => $this->computeAggregates($platforms, $filters),
+        );
+    }
+
+    /**
+     * The uncached body of getAggregates().
+     *
+     * @param  array<string>  $platforms
+     * @param  array<string, mixed>  $filters
+     * @return array<string, mixed>
+     */
+    private function computeAggregates(array $platforms, array $filters): array
+    {
+        $platforms = $this->targetPlatforms($platforms, $filters);
+
+        if ($platforms === []) {
+            return $this->emptyAggregates();
+        }
+
+        $conn = $this->cortex->connection();
+
+        // One pass for the platform/sentiment breakdown, which also carries the
+        // engagement sums — they share a grouping key, so there is no reason to
+        // scan twice for them.
+        $bindings = [];
+        $base     = $this->baseUnion($platforms, $filters, $bindings);
+        $rows     = $conn->select(
+            "SELECT platform, sentiment, count(*) AS n,
+                    COALESCE(sum(likes), 0)    AS likes,
+                    COALESCE(sum(comments), 0) AS comments,
+                    COALESCE(sum(shares), 0)   AS shares,
+                    COALESCE(sum(views), 0)    AS views
+             FROM {$base} AS b GROUP BY 1, 2",
+            $bindings
+        );
+
+        $total = 0;
+        $bySentiment = ['positive' => 0, 'neutral' => 0, 'negative' => 0];
+        $byPlatform  = [];
+
+        foreach ($rows as $row) {
+            $n         = (int) $row->n;
+            $sentiment = $row->sentiment ?: 'neutral';
+            $total    += $n;
+            $bySentiment[$sentiment] = ($bySentiment[$sentiment] ?? 0) + $n;
+
+            $p = $byPlatform[$row->platform] ??= [
+                'platform' => $row->platform, 'positive' => 0, 'neutral' => 0,
+                'negative' => 0, 'total' => 0, 'likes' => 0, 'comments' => 0,
+                'shares' => 0, 'views' => 0,
+            ];
+            $p[$sentiment]  += $n;
+            $p['total']     += $n;
+            $p['likes']     += (int) $row->likes;
+            $p['comments']  += (int) $row->comments;
+            $p['shares']    += (int) $row->shares;
+            $p['views']     += (int) $row->views;
+            $byPlatform[$row->platform] = $p;
+        }
+
+        // GROUP BY returns platforms in whatever order Postgres pleases, which
+        // reshuffled every chart keyed on platform. Restore the caller's order.
+        $ordered = [];
         foreach ($platforms as $platform) {
-            $rows = $this->cortex->table($platform)
-                ->select('keyword')
-                ->whereNotNull('keyword')
-                ->where('keyword', '!=', '')
-                ->distinct()
-                ->orderBy('keyword', 'asc')
+            if (isset($byPlatform[$platform])) {
+                $ordered[$platform] = $byPlatform[$platform];
+            }
+        }
+        $byPlatform = $ordered;
+
+        $positive = $bySentiment['positive'];
+        $negative = $bySentiment['negative'];
+        $pct = fn (int $n) => $total > 0 ? round($n / $total * 100, 2) : 0;
+
+        return [
+            'net_sentiment'        => $total > 0 ? round((($positive - $negative) / $total) * 100, 2) : 0,
+            'sentiment_percentage' => [
+                'positive' => $pct($positive),
+                'neutral'  => $pct($bySentiment['neutral']),
+                'negative' => $pct($negative),
+            ],
+            'negative_words'       => $this->topWordsSql($platforms, $filters, 'negative'),
+            'positive_words'       => $this->topWordsSql($platforms, $filters, 'positive'),
+            'trend'                => $this->trendSql($platforms, $filters),
+            'trend_by_platform'    => $this->trendByPlatformSql($platforms, $filters),
+            'platform_sentiment'   => array_values(array_map(
+                fn (array $p) => array_intersect_key($p, array_flip(['platform', 'positive', 'neutral', 'negative', 'total'])),
+                $byPlatform
+            )),
+            'mention_by_platform'  => array_values(array_map(
+                fn (array $p) => ['platform' => $p['platform'], 'count' => $p['total']],
+                $byPlatform
+            )),
+            'mention_by_media'     => $this->groupCountSql($platforms, $filters, 'type', 'media', true),
+            'mention_by_province'  => $this->groupCountSql($platforms, $filters, 'region', 'province', false),
+            'top_topics'           => $this->topTopicsSql($platforms, $filters),
+            'engagement'           => array_values(array_map(fn (array $p) => [
+                'platform' => $p['platform'],
+                'likes'    => $p['likes'],
+                'comments' => $p['comments'],
+                'shares'   => $p['shares'],
+                'views'    => $p['views'],
+                'total'    => $p['likes'] + $p['comments'] + $p['shares'] + $p['views'],
+            ], $byPlatform)),
+            'total'                => $total,
+        ];
+    }
+
+    /**
+     * Fetch one page of the table.
+     *
+     * Two steps on purpose: the union only sorts and pages over the columns it
+     * needs to order by, then the ≤200 winning rows are read in full and handed
+     * to the existing normalizers. That keeps a single definition of how a row
+     * becomes an API object, rather than reimplementing every normalizer in SQL.
+     *
+     * @param  array<string>  $platforms
+     * @return array{data: array<int, array<string, mixed>>, meta: array<string, int>}
+     */
+    public function getTablePage(array $platforms, array $filters, int $page, int $perPage, ?string $sortBy, string $sortDir, int $total): array
+    {
+        $sortable = ['date', 'platform', 'region', 'sentiment', 'author',
+                     'likes', 'comments', 'shares', 'views'];
+
+        $sortBy  = in_array($sortBy, $sortable, true) ? $sortBy : 'date';
+        $sortDir = strtolower($sortDir) === 'asc' ? 'ASC' : 'DESC';
+
+        // Sorting by date orders on the raw timestamp, not the formatted string,
+        // so the expression index can serve it. NULLS placement is spelled out
+        // to match that index in both directions — DESC reads it forward,
+        // ASC reads it backward.
+        if ($sortBy === 'date') {
+            $orderBy = $sortDir === 'ASC' ? 'sort_ts ASC NULLS FIRST' : 'sort_ts DESC NULLS LAST';
+        } else {
+            $orderBy = "{$sortBy} {$sortDir}";
+        }
+
+        $perPage = max(1, min($perPage, self::MAX_PER_PAGE));
+        $pages   = (int) max(1, ceil($total / $perPage));
+        $page    = max(1, min($page, $pages));
+
+        $meta = ['total' => $total, 'page' => $page, 'per_page' => $perPage, 'pages' => $pages];
+
+        $targets = $this->targetPlatforms($platforms, $filters);
+
+        if ($targets === [] || $total === 0) {
+            return ['data' => [], 'meta' => $meta];
+        }
+
+        $bindings = [];
+        $base     = $this->baseUnion($targets, $filters, $bindings, withText: false, withHashtags: false);
+
+        // "id" is the table's own primary key, unique only within a platform,
+        // so the pair is what identifies a row. The tiebreaker keeps paging
+        // stable when the sort column has duplicates.
+        $keys = $this->cortex->connection()->select(
+            "SELECT platform, id FROM {$base} AS b
+             ORDER BY {$orderBy}, platform ASC, id ASC
+             LIMIT {$perPage} OFFSET " . (($page - 1) * $perPage),
+            $bindings
+        );
+
+        if ($keys === []) {
+            return ['data' => [], 'meta' => $meta];
+        }
+
+        $idsByPlatform = [];
+        foreach ($keys as $key) {
+            $idsByPlatform[$key->platform][] = $key->id;
+        }
+
+        // Read the winning rows in full, then restore the order the union gave us.
+        $rowsByKey = [];
+        foreach ($idsByPlatform as $platform => $ids) {
+            $records = $this->cortex->table($platform)
+                ->selectRaw($this->selectSql($platform))
+                ->whereIn('id', $ids)
                 ->get();
 
-            foreach ($rows as $row) {
-                $kw = trim((string) $row->keyword);
-                if ($kw !== '' && ! in_array($kw, $keywords, true)) {
-                    $keywords[] = $kw;
+            foreach ($records as $record) {
+                $record = (array) $record;
+                $normalised = $this->normalise($platform, $record);
+                if ($normalised !== null) {
+                    $rowsByKey[$platform . ':' . $record['id']] = $normalised;
                 }
             }
         }
 
-        return $keywords;
+        $data = [];
+        foreach ($keys as $key) {
+            $lookup = $key->platform . ':' . $key->id;
+            if (isset($rowsByKey[$lookup])) {
+                $data[] = $rowsByKey[$lookup];
+            }
+        }
+
+        return ['data' => $data, 'meta' => $meta];
+    }
+
+    /** The shape returned when a client has no data at all. */
+    private function emptyAggregates(): array
+    {
+        return [
+            'net_sentiment'        => 0,
+            'sentiment_percentage' => ['positive' => 0, 'neutral' => 0, 'negative' => 0],
+            'negative_words'       => [],
+            'positive_words'       => [],
+            'trend'                => [],
+            'platform_sentiment'   => [],
+            'mention_by_platform'  => [],
+            'mention_by_media'     => [],
+            'mention_by_province'  => [],
+            'top_topics'           => [],
+            'engagement'           => [],
+            'trend_by_platform'    => [],
+            'total'                => 0,
+        ];
+    }
+
+    /**
+     * Narrow the platform list by the `platform` filter, matching the
+     * "unavailable platform means no rows" rule getFilteredData() applies.
+     *
+     * @param  array<string>  $platforms
+     * @return array<string>
+     */
+    private function targetPlatforms(array $platforms, array $filters): array
+    {
+        $requested = $filters['platform'] ?? null;
+
+        if ($requested) {
+            return in_array($requested, $platforms, true) ? [$requested] : [];
+        }
+
+        return array_values($platforms);
+    }
+
+    // ── query builders ────────────────────────────────────────────────────
+
+    /** @param array<string> $platforms */
+    private function trendSql(array $platforms, array $filters): array
+    {
+        $bindings = [];
+        $base     = $this->baseUnion($platforms, $filters, $bindings, withText: false);
+
+        $rows = $this->cortex->connection()->select(
+            "SELECT \"date\", sentiment, count(*) AS n FROM {$base} AS b GROUP BY 1, 2 ORDER BY 1",
+            $bindings
+        );
+
+        $trend = [];
+        foreach ($rows as $row) {
+            $date = (string) $row->date;
+            $trend[$date] ??= ['date' => $date, 'positive' => 0, 'neutral' => 0, 'negative' => 0, 'total' => 0];
+            $trend[$date][$row->sentiment ?: 'neutral'] += (int) $row->n;
+            $trend[$date]['total'] += (int) $row->n;
+        }
+
+        ksort($trend);
+
+        return array_values($trend);
+    }
+
+    /**
+     * Mention counts per date *and* platform, for the multi-line trend chart.
+     *
+     * Kept separate from trendSql() rather than folded into it: `trend` is also
+     * read as one row per date (positive/neutral/negative series), and splitting
+     * it by platform would give that consumer four rows per date.
+     *
+     * The chart used to derive these lines client-side from the full row dump,
+     * which silently became one page of results once the table was paginated.
+     *
+     * @param  array<string>  $platforms
+     */
+    private function trendByPlatformSql(array $platforms, array $filters): array
+    {
+        $bindings = [];
+        $base     = $this->baseUnion($platforms, $filters, $bindings, withText: false, withHashtags: false);
+
+        $rows = $this->cortex->connection()->select(
+            "SELECT \"date\", platform, count(*) AS n FROM {$base} AS b GROUP BY 1, 2 ORDER BY 1, 2",
+            $bindings
+        );
+
+        return array_map(fn ($row) => [
+            'date'     => (string) $row->date,
+            'platform' => (string) $row->platform,
+            'total'    => (int) $row->n,
+        ], $rows);
+    }
+
+    /**
+     * Count rows grouped by a single projected column.
+     *
+     * @param  array<string>  $platforms
+     * @param  bool  $keepBlank  mention_by_media reports blanks as "unknown";
+     *                           mention_by_province drops them entirely.
+     */
+    private function groupCountSql(array $platforms, array $filters, string $column, string $label, bool $keepBlank): array
+    {
+        $bindings = [];
+        $base     = $this->baseUnion($platforms, $filters, $bindings, withText: false);
+        $where    = $keepBlank ? '' : " WHERE COALESCE({$column}, '') <> ''";
+
+        $rows = $this->cortex->connection()->select(
+            "SELECT COALESCE({$column}, '') AS k, count(*) AS n FROM {$base} AS b{$where} GROUP BY 1 ORDER BY 2 DESC",
+            $bindings
+        );
+
+        return array_map(fn ($row) => [
+            $label  => $keepBlank ? ($row->k ?: 'unknown') : $row->k,
+            'count' => (int) $row->n,
+        ], $rows);
+    }
+
+    /**
+     * Top words in the post text for one sentiment — the SQL twin of topWords():
+     * lowercase, split on whitespace, strip everything but a-z0-9, keep >3 chars.
+     *
+     * @param  array<string>  $platforms
+     */
+    private function topWordsSql(array $platforms, array $filters, string $sentiment, int $limit = 10): array
+    {
+        $bindings = [];
+        $base     = $this->baseUnion($platforms, $filters, $bindings);
+        $bindings[] = $sentiment;
+
+        $rows = $this->cortex->connection()->select(
+            "SELECT w, count(*) AS n FROM (
+                SELECT regexp_replace(lower(word), '[^a-z0-9]', '', 'g') AS w
+                FROM {$base} AS b,
+                     LATERAL regexp_split_to_table(b.\"text\", '\\s+') AS word
+                WHERE b.sentiment = ?
+             ) AS t
+             WHERE length(w) > 3
+             GROUP BY w ORDER BY n DESC, w ASC LIMIT {$limit}",
+            $bindings
+        );
+
+        return array_map(fn ($row) => ['word' => $row->w, 'count' => (int) $row->n], $rows);
+    }
+
+    /** @param array<string> $platforms */
+    private function topTopicsSql(array $platforms, array $filters, int $limit = 10): array
+    {
+        $bindings = [];
+        $base     = $this->baseUnion($platforms, $filters, $bindings, withText: false);
+
+        $rows = $this->cortex->connection()->select(
+            "SELECT tag, count(*) AS n FROM (
+                SELECT jsonb_array_elements_text(b.hashtags) AS tag FROM {$base} AS b
+             ) AS t
+             WHERE tag <> ''
+             GROUP BY tag ORDER BY n DESC, tag ASC LIMIT {$limit}",
+            $bindings
+        );
+
+        return array_map(fn ($row) => ['topic' => $row->tag, 'count' => (int) $row->n], $rows);
+    }
+
+    // ── per-platform SQL projections ──────────────────────────────────────
+
+    /**
+     * The UNION ALL of every platform table, projected into the normalised
+     * column set the aggregates work against.
+     *
+     * @param  array<string>  $platforms
+     * @param  array<int, mixed>  $bindings  Appended to in statement order.
+     * @param  bool  $withText  Include the post text — only the word counts need it.
+     * @param  bool  $withHashtags  Include the hashtag array — only top_topics needs it.
+     */
+    private function baseUnion(array $platforms, array $filters, array &$bindings, bool $withText = true, bool $withHashtags = true): string
+    {
+        $schema = $this->cortex->currentSchema();
+        $parts  = [];
+
+        foreach ($platforms as $platform) {
+            // Order matters: these push bindings in the order they appear in the SQL.
+            $sentiment = $this->sentimentSql($platform, $bindings);
+            $hashtags  = $withHashtags ? ', ' . $this->hashtagsSql($platform) . ' AS hashtags' : '';
+            $text      = $withText ? ", COALESCE(content, '') AS \"text\"" : '';
+            $where     = $this->whereSql($platform, $filters, $bindings);
+
+            $parts[] = "SELECT id, '{$platform}'::text AS platform, "
+                . "{$sentiment} AS sentiment, "
+                . $this->dateSql() . " AS \"date\", "
+                . $this->sortTsSql() . " AS sort_ts, "
+                . $this->regionSql($platform) . " AS region, "
+                . $this->typeSql($platform) . " AS \"type\", "
+                . $this->authorSql($platform) . " AS author, "
+                . $this->engagementSql($platform, 'likes') . " AS likes, "
+                . $this->engagementSql($platform, 'comments') . " AS comments, "
+                . $this->engagementSql($platform, 'shares') . " AS shares, "
+                . $this->engagementSql($platform, 'views') . " AS views"
+                . $hashtags
+                . $text
+                . " FROM \"{$schema}\".\"{$platform}\"{$where}";
+        }
+
+        return '(' . implode(' UNION ALL ', $parts) . ')';
+    }
+
+    /**
+     * WHERE clause for one platform table.
+     *
+     * Date bounds are plain range comparisons rather than whereDate()'s
+     * `post_created_at::date`, so a btree index on the column can actually be
+     * used once one exists.
+     */
+    private function whereSql(string $platform, array $filters, array &$bindings): string
+    {
+        $clauses = [];
+
+        if (! empty($filters['start_date'])) {
+            $clauses[]  = 'post_created_at >= ?';
+            $bindings[] = $filters['start_date'];
+        }
+        if (! empty($filters['end_date'])) {
+            // Exclusive upper bound on the next day, so the whole end day counts.
+            $clauses[]  = 'post_created_at < ?';
+            $bindings[] = Carbon::parse($filters['end_date'])->addDay()->toDateString();
+        }
+
+        if (! empty($filters['keyword'])) {
+            if (is_array($filters['keyword'])) {
+                $placeholders = implode(', ', array_fill(0, count($filters['keyword']), '?'));
+                $clauses[]    = "keyword IN ({$placeholders})";
+                foreach ($filters['keyword'] as $keyword) {
+                    $bindings[] = $keyword;
+                }
+            } else {
+                $clauses[]  = "(content ILIKE ? OR keyword ILIKE ? OR metrics->>'caption' ILIKE ?)";
+                $like       = '%' . $filters['keyword'] . '%';
+                $bindings[] = $like;
+                $bindings[] = $like;
+                $bindings[] = $like;
+            }
+        }
+
+        if (! empty($filters['region'])) {
+            $clauses[]  = $this->regionSql($platform) . ' = ?';
+            $bindings[] = $filters['region'];
+        }
+
+        return $clauses === [] ? '' : ' WHERE ' . implode(' AND ', $clauses);
+    }
+
+    /**
+     * SQL mirror of resolveSentiment(): DB column, then the reference-schema
+     * keyword map, then Facebook reactions, then the hardcoded map.
+     */
+    private function sentimentSql(string $platform, array &$bindings): string
+    {
+        $branches = ["CASE WHEN sentiment IN ('positive','negative','neutral') THEN sentiment END"];
+
+        $keywordExpr = "lower(trim(COALESCE(keyword, '')))";
+
+        $map = $this->getKeywordSentimentMap();
+        if ($map !== []) {
+            $case = "CASE {$keywordExpr}";
+            foreach ($map as $keyword => $sentiment) {
+                $case .= ' WHEN ? THEN ?';
+                $bindings[] = (string) $keyword;
+                $bindings[] = (string) $sentiment;
+            }
+            $branches[] = $case . ' END';
+        }
+
+        if ($platform === 'facebook') {
+            $branches[] = $this->reactionsSql();
+        }
+
+        // Class constant — safe to inline.
+        $hardcoded = "CASE {$keywordExpr}";
+        foreach (self::KEYWORD_SENTIMENTS as $keyword => $sentiment) {
+            $hardcoded .= " WHEN '{$keyword}' THEN '{$sentiment}'";
+        }
+        $branches[] = $hardcoded . ' END';
+
+        $branches[] = "'neutral'";
+
+        return 'COALESCE(' . implode(', ', $branches) . ')';
+    }
+
+    /** SQL mirror of sentimentFromReactions(). */
+    private function reactionsSql(): string
+    {
+        $sum = "(SELECT COALESCE(sum(e.value::numeric), 0)
+                 FROM jsonb_each_text(metrics->'reactions') AS e(key, value)
+                 WHERE e.value ~ '^-?[0-9]+(\\.[0-9]+)?$')";
+
+        $pick = fn (string $key) => "CASE WHEN jsonb_typeof(metrics->'reactions'->'{$key}') = 'number'
+                                          THEN (metrics->'reactions'->>'{$key}')::numeric ELSE 0 END";
+
+        $negative = $pick('angry') . ' + ' . $pick('sad');
+        $positive = $pick('like') . ' + ' . $pick('love') . ' + ' . $pick('wow') . ' + ' . $pick('care');
+
+        return "CASE WHEN jsonb_typeof(metrics->'reactions') = 'object' THEN
+                    CASE
+                        WHEN {$sum} = 0 THEN 'neutral'
+                        WHEN ({$negative}) > {$sum} * 0.5 THEN 'negative'
+                        WHEN ({$positive}) > {$sum} * 0.5 THEN 'positive'
+                        ELSE 'neutral'
+                    END
+                END";
+    }
+
+    /** SQL mirror of parseDate(): the DB timestamp wins, created_at backs it up. */
+    private function dateSql(): string
+    {
+        return "to_char(COALESCE(post_created_at, created_at, DATE '2026-01-01'), 'YYYY-MM-DD')";
+    }
+
+    /**
+     * The raw timestamp behind dateSql(), used for ORDER BY.
+     *
+     * Sorting on dateSql() itself would mean sorting on `to_char(...)`, which no
+     * btree on the column can satisfy — Postgres had to materialise and sort
+     * every row. This expression is indexable, and the index must be declared
+     * over exactly the same text to be matched:
+     *
+     *   CREATE INDEX ... ON <table> ((COALESCE(post_created_at, created_at)) DESC NULLS LAST)
+     */
+    private function sortTsSql(): string
+    {
+        return 'COALESCE(post_created_at, created_at)';
+    }
+
+    /** Per-platform `type`, with the same defaults the normalizers apply. */
+    private function typeSql(string $platform): string
+    {
+        return match ($platform) {
+            // COALESCE, not NULLIF: an explicit empty string is kept, matching
+            // `?? 'post'`, which only substitutes when the key is absent or null.
+            'facebook'  => "COALESCE(metrics->>'type', 'post')",
+            'instagram' => "lower(COALESCE(metrics->>'type', 'image'))",
+            'tiktok'    => "'video'::text",
+            'twitter'   => "COALESCE(metrics->>'type', 'tweet')",
+            default     => "''::text",
+        };
+    }
+
+    /** Per-platform author, used only as a sort key. */
+    private function authorSql(string $platform): string
+    {
+        return match ($platform) {
+            'facebook'  => "COALESCE(metrics->'author'->>'name', metrics->>'author', '')",
+            'instagram' => "COALESCE(metrics->>'ownerFullName', metrics->>'ownerUsername', '')",
+            'tiktok'    => "COALESCE(metrics->'authorMeta'->>'nickName', metrics->'authorMeta'->>'name', '')",
+            'twitter'   => "COALESCE(metrics->'author'->>'name', metrics->'author'->>'userName', metrics->>'author', '')",
+            default     => "''::text",
+        };
+    }
+
+    /** Per-platform engagement counter, mirroring the normalizers' field picks. */
+    private function engagementSql(string $platform, string $metric): string
+    {
+        $num = fn (string $path) => "CASE WHEN jsonb_typeof({$path}) = 'number'
+                                         THEN trunc(({$path}#>>'{}')::numeric) ELSE 0 END";
+
+        $map = [
+            'facebook' => [
+                // `??` in the normalizer falls back only when the key is missing,
+                // not when it is a genuine 0 — so test for presence, not for zero.
+                'likes'    => "CASE WHEN jsonb_typeof(metrics->'reactions'->'like') = 'number'
+                                    THEN trunc((metrics->'reactions'->>'like')::numeric)
+                                    ELSE {$num("metrics->'reactions_count'")} END",
+                'comments' => $num("metrics->'comments_count'"),
+                'shares'   => $num("metrics->'reshare_count'"),
+                'views'    => '0',
+            ],
+            'instagram' => [
+                'likes'    => $num("metrics->'likesCount'"),
+                'comments' => $num("metrics->'commentsCount'"),
+                'shares'   => '0',
+                'views'    => '0',
+            ],
+            'tiktok' => [
+                'likes'    => $num("metrics->'diggCount'"),
+                'comments' => $num("metrics->'commentCount'"),
+                'shares'   => $num("metrics->'shareCount'"),
+                'views'    => $num("metrics->'playCount'"),
+            ],
+            'twitter' => [
+                'likes'    => $num("metrics->'likeCount'"),
+                'comments' => $num("metrics->'replyCount'"),
+                'shares'   => $num("metrics->'retweetCount'"),
+                'views'    => $num("metrics->'viewCount'"),
+            ],
+        ];
+
+        return '(' . ($map[$platform][$metric] ?? '0') . ')::bigint';
+    }
+
+    /**
+     * Hashtags as a flat lowercase jsonb array, whichever shape the platform
+     * stores them in: bare strings, `{name}` objects, `entities.hashtags`
+     * `{text}` objects, or — for facebook — nothing but the post text.
+     */
+    private function hashtagsSql(string $platform): string
+    {
+        $fromArray = function (string $path, string $key) {
+            return "CASE WHEN jsonb_typeof({$path}) = 'array' THEN COALESCE((
+                        SELECT jsonb_agg(t) FROM (
+                            SELECT lower(CASE WHEN jsonb_typeof(h) = 'object'
+                                              THEN COALESCE(h->>'{$key}', '')
+                                              ELSE ltrim(h#>>'{}', '#') END) AS t
+                            FROM jsonb_array_elements({$path}) AS h
+                        ) AS x WHERE t <> ''
+                    ), '[]'::jsonb) ELSE '[]'::jsonb END";
+        };
+
+        // Facebook has no hashtag field; the normalizer regexes the text instead.
+        $fromText = "COALESCE((
+            SELECT jsonb_agg(lower(m[1]))
+            FROM regexp_matches(COALESCE(content, ''), '#(\\w+)', 'g') AS m
+        ), '[]'::jsonb)";
+
+        return match ($platform) {
+            'instagram', 'tiktok' => $fromArray("metrics->'hashtags'", 'name'),
+            'twitter'             => $fromArray("metrics->'entities'->'hashtags'", 'text'),
+            default               => $fromText,
+        };
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -579,125 +1388,12 @@ class CortexDashboardService
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // Aggregation helpers
-    // ──────────────────────────────────────────────────────────────────────
-
-    private function topWords(Collection $items, int $limit = 10): array
-    {
-        $words = [];
-        foreach ($items as $item) {
-            $text = strtolower((string) ($item['text'] ?? ''));
-            foreach (preg_split('/\s+/', $text) as $word) {
-                $word = preg_replace('/[^a-z0-9]/u', '', $word);
-                if (strlen($word) > 3) {
-                    $words[$word] = ($words[$word] ?? 0) + 1;
-                }
-            }
-        }
-        arsort($words);
-        $top = array_slice($words, 0, $limit, true);
-        return array_map(fn ($w, $c) => ['word' => $w, 'count' => $c], array_keys($top), $top);
-    }
-
-    private function buildTrend(Collection $items): array
-    {
-        $grouped = $items->groupBy('date');
-        $trend   = [];
-        foreach ($grouped->sortKeys() as $date => $group) {
-            $trend[] = [
-                'date'     => $date,
-                'positive' => $group->where('sentiment', 'positive')->count(),
-                'neutral'  => $group->where('sentiment', 'neutral')->count(),
-                'negative' => $group->where('sentiment', 'negative')->count(),
-                'total'    => $group->count(),
-            ];
-        }
-        return $trend;
-    }
-
-    private function buildPlatformSentiment(Collection $items): array
-    {
-        return $items->groupBy('platform')->map(fn ($g, $platform) => [
-            'platform' => $platform,
-            'positive' => $g->where('sentiment', 'positive')->count(),
-            'neutral'  => $g->where('sentiment', 'neutral')->count(),
-            'negative' => $g->where('sentiment', 'negative')->count(),
-            'total'    => $g->count(),
-        ])->values()->all();
-    }
-
-    private function buildMentionByPlatform(Collection $items): array
-    {
-        return $items->groupBy('platform')->map(fn ($g, $p) => [
-            'platform' => $p,
-            'count'    => $g->count(),
-        ])->values()->all();
-    }
-
-    private function buildMentionByMedia(Collection $items): array
-    {
-        return $items->groupBy('type')->map(fn ($g, $type) => [
-            'media' => $type ?: 'unknown',
-            'count' => $g->count(),
-        ])->values()->all();
-    }
-
-    private function buildMentionByProvince(Collection $items): array
-    {
-        return $items->filter(fn ($i) => ! empty($i['region']))
-            ->groupBy('region')
-            ->map(fn ($g, $region) => ['province' => $region, 'count' => $g->count()])
-            ->values()->all();
-    }
-
-    private function buildTopTopics(Collection $items, int $limit = 10): array
-    {
-        $topics = [];
-        foreach ($items as $item) {
-            foreach ((array) ($item['hashtags'] ?? []) as $tag) {
-                $t = strtolower((string) $tag);
-                if ($t !== '') {
-                    $topics[$t] = ($topics[$t] ?? 0) + 1;
-                }
-            }
-        }
-        arsort($topics);
-        $top = array_slice($topics, 0, $limit, true);
-        return array_map(fn ($t, $c) => ['topic' => $t, 'count' => $c], array_keys($top), $top);
-    }
-
-    private function buildEngagement(Collection $items): array
-    {
-        return $items->groupBy('platform')->map(fn ($g, $platform) => [
-            'platform' => $platform,
-            'likes'    => $g->sum('likes'),
-            'comments' => $g->sum('comments'),
-            'shares'   => $g->sum('shares'),
-            'views'    => $g->sum('views'),
-            'total'    => $g->sum('likes') + $g->sum('comments') + $g->sum('shares') + $g->sum('views'),
-        ])->values()->all();
-    }
-
-    // ──────────────────────────────────────────────────────────────────────
     // Region extraction (same province list as legacy service)
     // ──────────────────────────────────────────────────────────────────────
 
     private function extractRegion(string $text): string
     {
-        static $provinces = [
-            'Aceh', 'Sumatera Utara', 'Sumatera Barat', 'Riau', 'Jambi',
-            'Sumatera Selatan', 'Bengkulu', 'Lampung', 'Bangka Belitung',
-            'Kepulauan Riau', 'DKI Jakarta', 'Jakarta', 'Jawa Barat',
-            'Jawa Tengah', 'DI Yogyakarta', 'Yogyakarta', 'Jawa Timur',
-            'Banten', 'Bali', 'Nusa Tenggara Barat', 'Nusa Tenggara Timur',
-            'Kalimantan Barat', 'Kalimantan Tengah', 'Kalimantan Selatan',
-            'Kalimantan Timur', 'Kalimantan Utara', 'Sulawesi Utara',
-            'Sulawesi Tengah', 'Sulawesi Selatan', 'Sulawesi Tenggara',
-            'Gorontalo', 'Sulawesi Barat', 'Maluku', 'Maluku Utara',
-            'Papua Barat', 'Papua',
-        ];
-
-        foreach ($provinces as $province) {
+        foreach (self::PROVINCES as $province) {
             if (stripos($text, $province) !== false) {
                 return $province;
             }
