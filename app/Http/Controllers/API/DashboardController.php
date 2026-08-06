@@ -128,7 +128,7 @@ class DashboardController extends Controller
         $filters = [
             'start_date' => $request->query('start_date'),
             'end_date'   => $request->query('end_date'),
-            'keyword'    => $request->query('keyword'),
+            'keyword'    => $request->query('keyword') ? explode(',', $request->query('keyword')) : null,
             'platform'   => $request->query('platform'),
             'region'     => $request->query('region'),
         ];
